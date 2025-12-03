@@ -8,20 +8,16 @@ def run_ev_peak_model(
     output_dir='./SU_output',
     slot_duration_minutes=2,
     total_minutes=1440,
-    # charging rate: kWh per minute when x_{i,k,n} = 1
     rate_kwh_per_min=5,
-    # price structure c_n
     price_mode='tou',       # 'constant' or 'tou'
     price_per_kwh_const=0.30,    # if price_mode='constant'
     tou_prices=(0.1, 0.2, 0.5),  # (off, flat, peak) if price_mode='tou'
-    # peak-demand coefficient λ
     lambda_cap=0.015,
-    # battery bounds B^u and B^L (kWh)
     B_upper_kwh_default=350.0,
     B_lower_kwh_default=30.0,
 ):
     """
-    Solve your MILP:
+    Solve the MILP:
 
       min  Σ_{i,k,n} c_n q_{i,k,n} x_{i,k,n}  +  λ Σ_y U_y
 
@@ -29,14 +25,12 @@ def run_ev_peak_model(
            (2) b_{i,k} + Σ_n q_{i,k,n} x_{i,k,n} ≤ B^u,  b_{i,k} ≥ B^L
            (3) Σ_{i,k} q_{i,k,n} x_{i,k,n} δ^y_{i,k,n} ≤ U_y, ∀y, n
            (4) x_{i,k,n} ∈ {0,1},  U_y ≥ 0
-
-    using your input.csv schema.
     """
 
     # ----------------- Load and preprocess input -----------------
     df = pd.read_csv(input_file)
 
-    # Rename / normalize columns to internal names
+    # Rename columns to internal names
     df = df.rename(
         columns={
             'v_num_id': 'bus_id',
@@ -68,8 +62,7 @@ def run_ev_peak_model(
     stations = sorted(df['station_id'].unique().tolist())  # Y
 
     # ---------- Generate time slots N_{i,k} within each window ----------
-    # Slots are [start_time, end_time) broken into slot_duration_minutes,
-    # with a shorter "tail" slot if needed.
+    # Slots are [start_time, end_time) broken into slot_duration_minutes, with a shorter "tail" slot if needed.
     slot_rows = []  # (i, k, n, slot_len, y)
     for _, row in df.iterrows():
         i = int(row['bus_id'])
@@ -102,7 +95,6 @@ def run_ev_peak_model(
     all_slots = sorted(slots_df['n'].unique().tolist())
 
     # ----------------- Parameters -----------------
-    # q_{i,k,n} = rate_kwh_per_min * slot_len
     slot_len_map = {(r.i, r.k, r.n): int(r.slot_len) for r in slots_df.itertuples(index=False)}
     q_dict = {(i, k, n): rate_kwh_per_min * slot_len_map[(i, k, n)] for (i, k, n) in slot_index}
 
@@ -114,7 +106,6 @@ def run_ev_peak_model(
         off, flat, peak = tou_prices
 
         def c_at_minute(m):
-            # Simple TOU partition over the operational day [0, total_minutes)
             peak_1_start = int(total_minutes * 8 / 24)
             peak_1_end = int(total_minutes * 11 / 24)
             peak_2_start = int(total_minutes * 18 / 24)
@@ -141,11 +132,11 @@ def run_ev_peak_model(
         else:
             drive_kwh[(i, k)] = float(row.iloc[0]['drive_kwh'])
 
-    # Battery bounds (can be customized per bus if needed)
+    # Battery bounds
     B_u = {i: B_upper_kwh_default for i in buses}
     B_l = {i: B_lower_kwh_default for i in buses}
 
-    # δ^y_{i,k,n}: we encode this by precomputing which (i,k,n) belong to (y,n)
+    # δ^y_{i,k,n}
     slots_by_y_n = {}
     for y in stations:
         for n in all_slots:
@@ -168,7 +159,7 @@ def run_ev_peak_model(
     b = m.addVars(windows, vtype=GRB.CONTINUOUS, name="b")     # b_{i,k}
     U = m.addVars(stations, vtype=GRB.CONTINUOUS, lb=0.0, name="U")  # U_y
 
-    # Battery capacity limits (2)
+    # Battery capacity limits
     for (i, k) in windows:
         # lower bound
         m.addConstr(b[(i, k)] >= B_l[i], name=f"b_lower({i},{k})")
@@ -182,7 +173,7 @@ def run_ev_peak_model(
         else:
             m.addConstr(b[(i, k)] <= B_u[i], name=f"b_upper({i},{k})")
 
-    # Initial SOC from start_soc for the first window per bus (if present)
+    # Initial SOC from start_soc for the first window per bus
     if 'start_soc' in df.columns:
         df['start_soc'] = df['start_soc'].astype(float)
         # first window row per bus
@@ -199,7 +190,7 @@ def run_ev_peak_model(
                 init_b = row['start_soc']
                 m.addConstr(b[(i, k0)] == init_b, name=f"init_b({i},{k0})")
 
-    # Battery energy balance (1)
+    # Battery energy balance
     for (i, k) in windows:
         if next_window_exists[(i, k)]:
             Nk = [n for (ii, kk, n) in slot_index.select(i, k, '*')]
@@ -209,8 +200,7 @@ def run_ev_peak_model(
                 name=f"energy_balance({i},{k})"
             )
 
-    # Station-level peak demand constraints (3)
-    # Σ_{i,k,n at (y,n)} q_{i,k,n} x_{i,k,n} ≤ U_y  ∀y, n
+    # Station-level peak demand constraints
     for y in stations:
         for n in all_slots:
             triplets = slots_by_y_n[(y, n)]
@@ -220,7 +210,7 @@ def run_ev_peak_model(
                     name=f"peak({y},{n})"
                 )
 
-    # Objective: Σ c_n q_{i,k,n} x_{i,k,n} + λ Σ_y U_y
+    # Objective
     energy_cost = quicksum(
         c_dict[(i, k, n)] * q_dict[(i, k, n)] * x[(i, k, n)]
         for (i, k, n) in slot_index
